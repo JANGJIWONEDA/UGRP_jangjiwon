@@ -1,0 +1,110 @@
+from datasets import load_dataset
+from transformers import AutoImageProcessor, AutoModelForImageClassification, TrainingArguments, Trainer
+from peft import LoraConfig, get_peft_model
+import torch
+from torchvision.transforms import (
+    Compose,
+    Normalize,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    ToTensor,
+)
+import logging
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load CIFAR-10 dataset with 8 classes
+def load_cifar10_subset(num_classes=8):
+    # Load CIFAR-10 dataset
+    dataset = load_dataset("cifar10")
+
+    # Select a subset of classes
+    selected_classes = list(range(num_classes))
+    dataset = dataset.filter(lambda example: example['label'] in selected_classes)
+
+    labels = dataset["train"].features["label"].names
+    label2id = {label: i for i, label in enumerate(labels) if i in selected_classes}
+    id2label = {i: label for label, i in label2id.items()}
+
+    return dataset, label2id, id2label
+
+dataset, label2id, id2label = load_cifar10_subset()
+
+# Restrict to 100 samples
+dataset['train'] = dataset['train'].select(range(100))
+
+# Image processor and transformations
+image_processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k", use_fast=True)
+
+normalize = Normalize(mean=image_processor.image_mean, std=image_processor.image_std)
+train_transforms = Compose(
+    [
+        RandomResizedCrop(image_processor.size["height"]),
+        RandomHorizontalFlip(),
+        ToTensor(),
+        normalize,
+    ]
+)
+
+def preprocess_train(example_batch):
+    example_batch["pixel_values"] = [train_transforms(image) for image in example_batch["img"]]
+    return {"pixel_values": example_batch["pixel_values"], "labels": example_batch["label"]}
+
+# Preprocess train dataset
+train_dataset = dataset["train"].map(preprocess_train, batched=True, remove_columns=["img", "label"])
+
+# LoRA configuration and model application
+model = AutoModelForImageClassification.from_pretrained(
+    "google/vit-base-patch16-224-in21k",
+    num_labels=len(label2id),
+    label2id=label2id,
+    id2label=id2label,
+)
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["attention.query", "attention.key", "attention.value", "intermediate.dense"],
+    lora_dropout=0.1,
+    bias="none",
+    modules_to_save=["classifier"],
+)
+model = get_peft_model(model, lora_config)
+
+# Training arguments without validation
+training_args = TrainingArguments(
+    output_dir="./results",
+    save_strategy="epoch",
+    learning_rate=5e-4,
+    per_device_train_batch_size=4,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    logging_steps=10,
+    save_total_limit=2,
+    load_best_model_at_end=False,
+    logging_dir='./logs',
+    remove_unused_columns=False,
+)
+
+# Data collator definition
+def collate_fn(examples):
+    pixel_values = torch.stack([torch.tensor(example["pixel_values"]) for example in examples])
+    labels = torch.tensor([example["labels"] for example in examples], dtype=torch.long)
+    return {"pixel_values": pixel_values, "labels": labels}
+
+# Trainer instance without validation
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    data_collator=collate_fn,
+)
+
+# Training
+trainer.train()
+
+# 모델과 이미지 프로세서를 로컬에 저장
+model.save_pretrained("./trained_model")
+image_processor.save_pretrained("./trained_model")
